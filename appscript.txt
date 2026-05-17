@@ -1,0 +1,447 @@
+/**
+ * Hamzury App — data layer (Google Apps Script web app).
+ *
+ * Backs the per-client template bank + CSO admin. The Node app
+ * (hamzury-app on Railway) calls this over HTTPS; this script is the
+ * durable system of record (Google Sheet).
+ *
+ * SETUP
+ *  1. Create (or reuse) a Google Sheet. Put its ID in SPREADSHEET_ID below.
+ *     Leave '' to auto-create a sheet named "HAMZURY_APP_DB" on first run.
+ *  2. Set SECRET below to a long random string.
+ *  3. Apps Script editor → Deploy → New deployment → Web app
+ *       Execute as: Me
+ *       Who has access: Anyone
+ *  4. Copy the /exec URL → set it in Railway as APPS_SCRIPT_URL,
+ *     and the same SECRET as APPS_SCRIPT_SECRET.
+ *  5. Run `setup` once from the editor to create all tabs + a demo client.
+ *
+ * Re-deploy a NEW VERSION after any edit (Deploy ▸ Manage ▸ edit ▸ deploy).
+ */
+
+var SPREADSHEET_ID = '';                 // '' = auto-create
+var SECRET = 'CHANGE_ME_LONG_RANDOM';    // must match APPS_SCRIPT_SECRET
+
+var TABS = {
+  CLIENTS:     ['client_id','name','first_name','phone','email','cso','cso_whatsapp','service','status','questionnaire_url','created','stage','amount','proposal_sent_at','last_followup_at','followups_sent','paid','paid_amount','paid_at','paid_method'],
+  LINKS:       ['client_id','tpl','status','opens','last_opened'],
+  M2A_ITEMS:   ['client_id','n','item','price','why'],
+  M11_ITEMS:   ['client_id','idx','name','date','done','delivered_at'],
+  INVOICE:     ['client_id','number','date','items','total','bank','account_name','account_number'],
+  DELIVERY:    ['client_id','service_name','folder_link'],
+  RENEWALS:    ['client_id','idx','name','date','monthIdx','day'],
+  SUBMISSIONS: ['ts','client_id','tpl','payload'],
+  EVENTS:      ['ts','client_id','tpl','type','ua'],
+  CATALOG:     ['service_id','division','item','price','why','active']
+};
+var TEMPLATES = ['m1','m3','m2a','m6a','m10','gift','m11'];
+
+/* ---------- spreadsheet helpers ---------- */
+function ss_() {
+  var props = PropertiesService.getScriptProperties();
+  var id = SPREADSHEET_ID || props.getProperty('SHEET_ID');
+  if (id) return SpreadsheetApp.openById(id);
+  var s = SpreadsheetApp.create('HAMZURY_APP_DB');
+  props.setProperty('SHEET_ID', s.getId());
+  return s;
+}
+function sheet_(name) {
+  var s = ss_(), sh = s.getSheetByName(name);
+  if (!sh) { sh = s.insertSheet(name); }
+  if (sh.getLastRow() === 0) { sh.appendRow(TABS[name]); return sh; }
+  // Migration: append any columns added to TABS that aren't in the header yet.
+  var lc = Math.max(sh.getLastColumn(), 1);
+  var hdr = sh.getRange(1, 1, 1, lc).getValues()[0].map(String);
+  var missing = TABS[name].filter(function (c) { return hdr.indexOf(c) === -1; });
+  if (missing.length) sh.getRange(1, hdr.length + 1, 1, missing.length).setValues([missing]);
+  return sh;
+}
+var STAGES = ['Discovery', 'Contacted', 'Qualifying', 'Proposal Sent', 'Following Up',
+  'Negotiating', 'Paid', 'In Progress', 'Delivered', 'Confirmed'];
+function stageRank_(s) { var i = STAGES.indexOf(s); return i < 0 ? 0 : i; }
+function bucket_(s) {
+  if (s === 'Lost') return 'Lost';
+  var r = stageRank_(s);
+  return r <= 1 ? 'Inbox' : r <= 5 ? 'Selling' : r <= 7 ? 'Doing' : 'Done';
+}
+function clientRow_(id) {
+  return rows_('CLIENTS').filter(function (r) { return String(r.client_id) === String(id); })[0];
+}
+function advanceStage_(id, to) {
+  var c = clientRow_(id); if (!c) return;
+  var cur = c.stage || 'Discovery';
+  if (cur === 'Lost') return;
+  if (stageRank_(to) > stageRank_(cur)) setCell_('CLIENTS', c._row, 'stage', to);
+}
+function asDate_(v) { try { return v ? new Date(v) : null; } catch (e) { return null; } }
+function sameDay_(a, b) { return a && b && a.toDateString() === b.toDateString(); }
+var FU_DAYS = [1, 3, 7];
+// follow-up due info for a client row, or null if none scheduled
+function followupInfo_(c) {
+  var ps = asDate_(c.proposal_sent_at);
+  if (!ps || c.paid === true || c.paid === 'TRUE' || c.paid === 1) return null;
+  if (bucket_(c.stage || 'Discovery') !== 'Selling') return null;
+  var sent = Number(c.followups_sent) || 0;
+  if (sent >= FU_DAYS.length) return null;
+  var due = new Date(ps.getTime() + FU_DAYS[sent] * 86400000);
+  var days = Math.floor((Date.now() - due.getTime()) / 86400000);
+  return { kind: 'D' + FU_DAYS[sent], due: due, overdueDays: days };
+}
+function rows_(name) {
+  var sh = sheet_(name), v = sh.getDataRange().getValues();
+  if (v.length < 2) return [];
+  var h = v[0].map(String), out = [];
+  for (var i = 1; i < v.length; i++) {
+    var o = { _row: i + 1 };
+    for (var c = 0; c < h.length; c++) o[h[c]] = v[i][c];
+    out.push(o);
+  }
+  return out;
+}
+function append_(name, obj) {
+  var sh = sheet_(name);
+  sh.appendRow(TABS[name].map(function (k) {
+    return obj[k] === undefined || obj[k] === null ? '' : obj[k];
+  }));
+}
+function setCell_(name, rowNum, col, val) {
+  var sh = sheet_(name), idx = TABS[name].indexOf(col);
+  if (idx > -1) sh.getRange(rowNum, idx + 1).setValue(val);
+}
+
+/* ---------- assemble a full client object ---------- */
+function buildClient_(id) {
+  var c = rows_('CLIENTS').filter(function (r) { return String(r.client_id) === String(id); })[0];
+  if (!c) return null;
+  var by = function (name) {
+    return rows_(name).filter(function (r) { return String(r.client_id) === String(id); });
+  };
+  var inv = by('INVOICE')[0] || {};
+  var del = by('DELIVERY')[0] || {};
+  return {
+    client_id: c.client_id, name: c.name, first_name: c.first_name || String(c.name || '').split(' ')[0],
+    phone: c.phone, email: c.email, cso: c.cso, cso_whatsapp: c.cso_whatsapp,
+    service: c.service, status: c.status || 'active', questionnaire_url: c.questionnaire_url,
+    stage: c.stage || 'Discovery', amount: Number(c.amount) || 0,
+    proposal_sent_at: c.proposal_sent_at || '', last_followup_at: c.last_followup_at || '',
+    followups_sent: Number(c.followups_sent) || 0,
+    paid: c.paid === true || c.paid === 'TRUE' || c.paid === 1,
+    paid_amount: Number(c.paid_amount) || 0, paid_at: c.paid_at || '', paid_method: c.paid_method || '',
+    m2a_items: by('M2A_ITEMS').sort(function (a, b) { return a.n - b.n; })
+      .map(function (r) { return { n: r.n, item: r.item, price: r.price, why: r.why }; }),
+    invoice: { number: inv.number, date: inv.date, items: inv.items, total: inv.total,
+      bank: inv.bank, account_name: inv.account_name, account_number: inv.account_number },
+    delivery: { service_name: del.service_name, folder_link: del.folder_link },
+    m11_items: by('M11_ITEMS').sort(function (a, b) { return a.idx - b.idx; })
+      .map(function (r) { return { name: r.name, date: r.date, done: r.done === true || r.done === 'TRUE' || r.done === 1 }; }),
+    renewals: by('RENEWALS').sort(function (a, b) { return a.idx - b.idx; })
+      .map(function (r) { return { name: r.name, date: r.date, monthIdx: Number(r.monthIdx), day: Number(r.day) }; })
+  };
+}
+
+function cname_(clients, id) { var c = clients.filter(function (r) { return String(r.client_id) === String(id); })[0]; return c ? c.name : id; }
+function esc_(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function relTime_(d) {
+  var s = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (s < 3600) return Math.max(1, Math.floor(s / 60)) + 'm';
+  if (s < 86400) return Math.floor(s / 3600) + 'h';
+  if (s < 172800) return 'Yest';
+  return Utilities.formatDate(d, Session.getScriptTimeZone() || 'Africa/Lagos', 'd MMM');
+}
+function dashboard_(q) {
+  var clients = rows_('CLIENTS'), m2a = rows_('M2A_ITEMS'),
+      subs = rows_('SUBMISSIONS'), events = rows_('EVENTS');
+  var now = new Date(), yest = new Date(now.getTime() - 86400000);
+  var hasM2A = {};
+  m2a.forEach(function (r) { hasM2A[String(r.client_id)] = true; });
+  var buckets = { Inbox: [], Selling: [], Doing: [], Done: [] };
+  var fuQueue = [], nx = null, tasks = [];
+  clients.forEach(function (c) {
+    if ((c.status || 'active') === 'revoked') return;
+    var stage = c.stage || 'Discovery';
+    if (stage === 'Lost') return;
+    var bk = bucket_(stage), amount = Number(c.amount) || 0, fi = followupInfo_(c);
+    var tag = stage;
+    if (fi) tag = fi.overdueDays > 0 ? (fi.kind + ' overdue') : fi.overdueDays === 0 ? (fi.kind + ' today') : stage;
+    if (buckets[bk]) buckets[bk].push({ client_id: c.client_id, name: c.name,
+      service: c.service || '', amount: amount, stage: stage, tag: tag, overdue: fi ? fi.overdueDays > 0 : false });
+    if (fi && fi.overdueDays >= 0) {
+      fuQueue.push({ client_id: c.client_id, name: c.name, amount: amount, kind: fi.kind, overdueDays: fi.overdueDays });
+      tasks.push({ client_id: c.client_id, text: 'Follow up ' + c.name + ' (' + fi.kind + (fi.overdueDays > 0 ? ' overdue' : ' today') + ')', urgent: fi.overdueDays > 0 });
+    }
+    if (stage === 'Qualifying' && !hasM2A[String(c.client_id)]) tasks.push({ client_id: c.client_id, text: 'Build proposal for ' + c.name, urgent: false });
+    if (stage === 'Paid') tasks.push({ client_id: c.client_id, text: 'Start work for ' + c.name, urgent: false });
+    if (stage === 'Delivered') tasks.push({ client_id: c.client_id, text: 'Confirm delivery with ' + c.name, urgent: false });
+  });
+  fuQueue.sort(function (a, b) { return (b.overdueDays - a.overdueDays) || (b.amount - a.amount); });
+  if (fuQueue.length) {
+    var t = fuQueue[0];
+    nx = { client_id: t.client_id, title: 'Call ' + t.name,
+      why: t.overdueDays > 0 ? (t.kind + ' follow-up overdue by ' + t.overdueDays + ' day' + (t.overdueDays > 1 ? 's' : '')) : (t.kind + ' follow-up due today'),
+      amount: t.amount, kind: 'followup', overdue: t.overdueDays > 0 };
+  } else {
+    var inbox = clients.filter(function (c) { return (c.status || 'active') !== 'revoked' && bucket_(c.stage || 'Discovery') === 'Inbox'; })
+      .sort(function (a, b) { return (asDate_(a.created) || 0) - (asDate_(b.created) || 0); });
+    if (inbox.length) nx = { client_id: inbox[0].client_id, title: 'Reach out to ' + inbox[0].name,
+      why: 'New lead — send M1 and discover the need', amount: Number(inbox[0].amount) || 0, kind: 'send_m1', overdue: false };
+  }
+  tasks = tasks.slice(0, 8);
+  var newToday = 0, newYest = 0;
+  clients.forEach(function (c) { var d = asDate_(c.created);
+    if (sameDay_(d, now)) newToday++; else if (sameDay_(d, yest)) newYest++; });
+  var propOut = 0, propVal = 0;
+  clients.forEach(function (c) { var s = c.stage || '';
+    if (s === 'Proposal Sent' || s === 'Following Up' || s === 'Negotiating') { propOut++; propVal += Number(c.amount) || 0; } });
+  var mKey = function (d) { return d ? (d.getFullYear() + '-' + d.getMonth()) : ''; };
+  var thisM = mKey(now), lastM = mKey(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+  var revThis = 0, revLast = 0;
+  clients.forEach(function (c) {
+    if (!(c.paid === true || c.paid === 'TRUE' || c.paid === 1)) return;
+    var pd = asDate_(c.paid_at), amt = Number(c.paid_amount) || 0;
+    if (mKey(pd) === thisM) revThis += amt; else if (mKey(pd) === lastM) revLast += amt;
+  });
+  var stats = { newLeads: newToday, newLeadsDelta: newToday - newYest,
+    followups: fuQueue.length, followupsOverdue: fuQueue.filter(function (x) { return x.overdueDays > 0; }).length,
+    proposalsOut: propOut, proposalsValue: propVal,
+    revenueMonth: revThis, revenueDeltaPct: revLast > 0 ? Math.round((revThis - revLast) / revLast * 100) : null };
+  var act = [];
+  clients.forEach(function (c) { var d = asDate_(c.created);
+    if (d) act.push({ ts: d, text: 'New lead <strong>' + esc_(c.name) + '</strong>' + (c.service ? (' · ' + esc_(c.service)) : ''), gold: false }); });
+  subs.forEach(function (r) { var d = asDate_(r.ts);
+    if (d) act.push({ ts: d, text: '<strong>' + esc_(cname_(clients, r.client_id)) + '</strong> replied (' + esc_(r.tpl || '') + ')', gold: false }); });
+  events.forEach(function (r) { var d = asDate_(r.ts); if (!d) return;
+    if (r.type === 'confirmed') act.push({ ts: d, text: 'Delivery confirmed by <strong>' + esc_(cname_(clients, r.client_id)) + '</strong>', gold: false });
+    else if (r.type === 'proposal') act.push({ ts: d, text: 'Proposal sent to <strong>' + esc_(cname_(clients, r.client_id)) + '</strong>', gold: true });
+    else if (r.type === 'paid') act.push({ ts: d, text: 'Payment received from <strong>' + esc_(cname_(clients, r.client_id)) + '</strong>', gold: false });
+    else if (r.type === 'agreement_accepted') act.push({ ts: d, text: '<strong>' + esc_(cname_(clients, r.client_id)) + '</strong> accepted the agreement', gold: true }); });
+  act.sort(function (a, b) { return b.ts - a.ts; });
+  act = act.slice(0, 12).map(function (x) { return { time: relTime_(x.ts), text: x.text, gold: x.gold }; });
+  var ql = String(q || '').toLowerCase().trim();
+  var clist = clients.filter(function (c) { return (c.status || 'active') !== 'revoked'; })
+    .filter(function (c) { return !ql || (String(c.name || '') + ' ' + String(c.service || '') + ' ' + String(c.phone || '')).toLowerCase().indexOf(ql) > -1; })
+    .map(function (c) { return { client_id: c.client_id, name: c.name, service: c.service || '', stage: c.stage || 'Discovery', amount: Number(c.amount) || 0 }; });
+  return { ok: true, stats: stats, nextAction: nx, pipeline: buckets,
+    followups: fuQueue.slice(0, 8), tasks: tasks, activity: act, clients: clist };
+}
+function out_(o) {
+  return ContentService.createTextOutput(JSON.stringify(o))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+function authed_(p) { return String(p.secret || '') === SECRET; }
+
+/* ---------- HTTP ---------- */
+function doGet(e) {
+  var p = e.parameter || {};
+  if (p.action === 'ping') return out_({ ok: true });
+  if (!authed_(p)) return out_({ ok: false, error: 'unauthorized' });
+  if (p.action === 'client') return out_({ ok: true, client: buildClient_(p.id) });
+  if (p.action === 'catalog') return out_({ ok: true, items: rows_('CATALOG').map(function (r) {
+    return { service_id: r.service_id, division: r.division, item: r.item, price: r.price, why: r.why,
+      active: !(r.active === false || r.active === 'FALSE' || r.active === 0 || r.active === '') };
+  }) });
+  if (p.action === 'submissions') return out_({ ok: true, submissions: rows_('SUBMISSIONS')
+    .filter(function (r) { return String(r.client_id) === String(p.id); })
+    .map(function (r) { return { ts: r.ts, tpl: r.tpl, payload: r.payload }; }) });
+  if (p.action === 'dashboard') return out_(dashboard_(p.q || ''));
+  if (p.action === 'listClients') {
+    var links = rows_('LINKS');
+    var list = rows_('CLIENTS').map(function (c) {
+      var op = links.filter(function (l) { return String(l.client_id) === String(c.client_id); })
+        .reduce(function (a, l) { return a + (Number(l.opens) || 0); }, 0);
+      return { client_id: c.client_id, name: c.name, cso: c.cso, service: c.service,
+        status: c.status || 'active', created: c.created, opens: op };
+    });
+    return out_({ ok: true, clients: list });
+  }
+  return out_({ ok: false, error: 'unknown action' });
+}
+
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(20000);
+    var b = JSON.parse(e.postData.contents || '{}');
+    if (!authed_(b)) return out_({ ok: false, error: 'unauthorized' });
+
+    // App logging (from the public pages)
+    if (b.kind === 'submission') {
+      append_('SUBMISSIONS', { ts: new Date(), client_id: b.clientId, tpl: b.tpl,
+        payload: JSON.stringify(b.payload || {}) });
+      advanceStage_(b.clientId, 'Qualifying');
+      return out_({ ok: true });
+    }
+    if (b.kind === 'event') {
+      append_('EVENTS', { ts: new Date(), client_id: b.clientId, tpl: b.tpl, type: b.type || 'open', ua: b.ua || '' });
+      if (b.type === 'open') {
+        var ls = rows_('LINKS').filter(function (l) {
+          return String(l.client_id) === String(b.clientId) && l.tpl === b.tpl; })[0];
+        if (ls) { setCell_('LINKS', ls._row, 'opens', (Number(ls.opens) || 0) + 1);
+          setCell_('LINKS', ls._row, 'last_opened', new Date()); }
+        advanceStage_(b.clientId, 'Contacted');
+      } else if (b.type === 'agreement_accepted') {
+        advanceStage_(b.clientId, 'Negotiating');
+      } else if (b.type === 'confirmed') {
+        advanceStage_(b.clientId, 'Delivered');
+      }
+      return out_({ ok: true });
+    }
+
+    // Admin actions
+    if (b.action === 'createClient') return out_(createClient_(b.client || {}));
+    if (b.action === 'addCatalog') {
+      append_('CATALOG', { service_id: 'svc-' + rand_(8), division: b.division || 'BIZDOC',
+        item: b.item || '', price: b.price || '', why: b.why || '', active: true });
+      return out_({ ok: true });
+    }
+    if (b.action === 'updateCatalog') {
+      var cat = rows_('CATALOG').filter(function (r) { return String(r.service_id) === String(b.service_id); })[0];
+      if (cat) {
+        if (b.item !== undefined) setCell_('CATALOG', cat._row, 'item', b.item);
+        if (b.price !== undefined) setCell_('CATALOG', cat._row, 'price', b.price);
+        if (b.why !== undefined) setCell_('CATALOG', cat._row, 'why', b.why);
+        if (b.active !== undefined) setCell_('CATALOG', cat._row, 'active', !!b.active);
+      }
+      return out_({ ok: true });
+    }
+    if (b.action === 'setM2A') {
+      var sh = sheet_('M2A_ITEMS'), data = sh.getDataRange().getValues();
+      for (var di = data.length - 1; di >= 1; di--) {
+        if (String(data[di][0]) === String(b.client_id)) sh.deleteRow(di + 1);
+      }
+      (b.items || []).forEach(function (it, ix) {
+        append_('M2A_ITEMS', { client_id: b.client_id, n: it.n || ix + 1,
+          item: it.item || '', price: it.price || '', why: it.why || '' });
+      });
+      var cm = clientRow_(b.client_id);
+      if (cm) {
+        if (b.amount !== undefined && b.amount !== '') setCell_('CLIENTS', cm._row, 'amount', Number(b.amount) || 0);
+        if ((b.items || []).length) {
+          if (!cm.proposal_sent_at) setCell_('CLIENTS', cm._row, 'proposal_sent_at', new Date());
+          advanceStage_(b.client_id, 'Proposal Sent');
+          append_('EVENTS', { ts: new Date(), client_id: b.client_id, tpl: 'm2a', type: 'proposal', ua: '' });
+        }
+      }
+      return out_({ ok: true });
+    }
+    if (b.action === 'setStage') {
+      var cs = clientRow_(b.client_id);
+      if (cs && STAGES.indexOf(b.stage) > -1) setCell_('CLIENTS', cs._row, 'stage', b.stage);
+      else if (cs && b.stage === 'Lost') setCell_('CLIENTS', cs._row, 'stage', 'Lost');
+      return out_({ ok: true });
+    }
+    if (b.action === 'markPaid') {
+      var cp = clientRow_(b.client_id);
+      if (cp) {
+        setCell_('CLIENTS', cp._row, 'paid', true);
+        setCell_('CLIENTS', cp._row, 'paid_amount', Number(b.amount) || 0);
+        setCell_('CLIENTS', cp._row, 'paid_at', b.date ? new Date(b.date) : new Date());
+        setCell_('CLIENTS', cp._row, 'paid_method', b.method || '');
+        advanceStage_(b.client_id, 'Paid');
+        append_('EVENTS', { ts: new Date(), client_id: b.client_id, tpl: 'm6a', type: 'paid', ua: '' });
+      }
+      return out_({ ok: true });
+    }
+    if (b.action === 'logFollowup') {
+      var cf = clientRow_(b.client_id);
+      if (cf) {
+        setCell_('CLIENTS', cf._row, 'followups_sent', (Number(cf.followups_sent) || 0) + 1);
+        setCell_('CLIENTS', cf._row, 'last_followup_at', new Date());
+        advanceStage_(b.client_id, 'Following Up');
+      }
+      return out_({ ok: true });
+    }
+    if (b.action === 'setM11') {
+      var m = rows_('M11_ITEMS').filter(function (r) {
+        return String(r.client_id) === String(b.client_id) && Number(r.idx) === Number(b.idx); })[0];
+      if (m) { setCell_('M11_ITEMS', m._row, 'done', !!b.done);
+        setCell_('M11_ITEMS', m._row, 'delivered_at', b.done ? new Date() : ''); }
+      return out_({ ok: true });
+    }
+    if (b.action === 'revoke') {
+      var cr = rows_('CLIENTS').filter(function (r) { return String(r.client_id) === String(b.client_id); })[0];
+      if (cr) setCell_('CLIENTS', cr._row, 'status', b.unrevoke ? 'active' : 'revoked');
+      return out_({ ok: true });
+    }
+    return out_({ ok: false, error: 'unknown action' });
+  } catch (err) {
+    return out_({ ok: false, error: String(err) });
+  } finally {
+    try { lock.releaseLock(); } catch (e2) {}
+  }
+}
+
+function slug_(s) {
+  return String(s || 'client').toLowerCase().replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '').slice(0, 20) || 'client';
+}
+function rand_(n) {
+  var a = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789', s = '';
+  for (var i = 0; i < n; i++) s += a.charAt(Math.floor(Math.random() * a.length));
+  return s;
+}
+
+function createClient_(c) {
+  var id = (c.client_id && String(c.client_id)) || (slug_(c.name) + '-' + rand_(10));
+  if (rows_('CLIENTS').some(function (r) { return String(r.client_id) === id; }))
+    id = slug_(c.name) + '-' + rand_(10);
+  append_('CLIENTS', {
+    client_id: id, name: c.name || '', first_name: (c.name || '').split(' ')[0],
+    phone: c.phone || '', email: c.email || '', cso: c.cso || '', cso_whatsapp: c.cso_whatsapp || '',
+    service: c.service || '', status: 'active', questionnaire_url: c.questionnaire_url || '',
+    created: new Date(), stage: 'Discovery', amount: Number(c.amount) || 0,
+    proposal_sent_at: '', last_followup_at: '', followups_sent: 0,
+    paid: false, paid_amount: 0, paid_at: '', paid_method: ''
+  });
+  TEMPLATES.forEach(function (t) {
+    append_('LINKS', { client_id: id, tpl: t, status: 'active', opens: 0, last_opened: '' });
+  });
+  (c.m2a_items || []).forEach(function (it, i) {
+    append_('M2A_ITEMS', { client_id: id, n: it.n || i + 1, item: it.item || '', price: it.price || '', why: it.why || '' });
+  });
+  (c.m11_items || []).forEach(function (it, i) {
+    append_('M11_ITEMS', { client_id: id, idx: i, name: it.name || '', date: it.date || '', done: !!it.done, delivered_at: '' });
+  });
+  (c.renewals || []).forEach(function (it, i) {
+    append_('RENEWALS', { client_id: id, idx: i, name: it.name || '', date: it.date || '',
+      monthIdx: it.monthIdx, day: it.day });
+  });
+  if (c.invoice) append_('INVOICE', Object.assign({ client_id: id }, c.invoice));
+  if (c.delivery) append_('DELIVERY', Object.assign({ client_id: id }, c.delivery));
+  return { ok: true, client_id: id };
+}
+
+/* Run once from the editor to create tabs + a demo client. */
+function setup() {
+  Object.keys(TABS).forEach(function (n) { sheet_(n); });
+  if (!rows_('CLIENTS').length) {
+    createClient_({
+      name: 'Adamu Ibrahim', first_name: 'Adamu', phone: '08012345678', email: 'adamu@example.com',
+      cso: 'Hauwa', cso_whatsapp: '2349130700056', service: 'BIZDOC · Compliance and registration',
+      m2a_items: [
+        { n: 1, item: 'CAC Ltd', price: '₦60,000', why: 'Open a corporate bank account.' },
+        { n: 2, item: 'TIN', price: '₦50,000', why: 'Stay tax compliant.' }
+      ],
+      m11_items: [{ name: 'CAC Ltd', date: 'Mar 12, 2026', done: true },
+        { name: 'TIN', date: 'Mar 18, 2026', done: false }],
+      renewals: [{ name: 'Annual Return Renewal', date: 'March 15, 2026', monthIdx: 2, day: 15 }],
+      invoice: { number: 'HMZ-2026/05-0001', date: 'May 16, 2026', items: 'CAC Ltd, TIN',
+        total: '₦110,000', bank: 'Providus', account_name: 'Hamzury Institute Ltd', account_number: '0123456789' },
+      delivery: { service_name: 'CAC Ltd Certificate', folder_link: 'https://drive.google.com/' }
+    });
+  }
+  if (!rows_('CATALOG').length) {
+    [['CAC Ltd', '₦60,000', 'Open a corporate bank account. Operate as a real company.'],
+     ['CAC Business Name', '₦40,000', 'Trade under a registered name. Earn customer trust.'],
+     ['TIN', '₦50,000', 'Open the bank account. Stay tax compliant.'],
+     ['SCUML', '₦120,000', 'Validate cash transactions in regulated sectors.'],
+     ['NAFDAC', 'from ₦300,000', 'Sell food, drugs, or cosmetics legally.'],
+     ['SON MANCAP', 'from ₦200,000', 'Manufacture certified products.'],
+     ['Tax Clearance', '₦300,000', 'Win contracts. Apply for loans. Get visas.'],
+     ['Annual Returns', '₦50,000', 'Keep CAC from deactivating your company.']]
+      .forEach(function (x) {
+        append_('CATALOG', { service_id: 'svc-' + rand_(8), division: 'BIZDOC',
+          item: x[0], price: x[1], why: x[2], active: true });
+      });
+  }
+  Logger.log('Setup done. Sheet: ' + ss_().getUrl());
+}
