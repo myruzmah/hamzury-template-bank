@@ -22,6 +22,11 @@
 var SPREADSHEET_ID = '';                 // '' = auto-create
 var SECRET = 'CHANGE_ME_LONG_RANDOM';    // must match APPS_SCRIPT_SECRET
 
+// Hamzury's receiving account — shown to every client on the M6A invoice.
+var INVOICE_BANK = 'OPAY';
+var INVOICE_ACCOUNT_NAME = 'BIZDOC CONSULT';
+var INVOICE_ACCOUNT_NUMBER = '8067149356';
+
 var TABS = {
   CLIENTS:     ['client_id','name','first_name','phone','email','cso','cso_whatsapp','service','status','questionnaire_url','created','stage','amount','proposal_sent_at','last_followup_at','followups_sent','paid','paid_amount','paid_at','paid_method'],
   LINKS:       ['client_id','tpl','status','opens','last_opened'],
@@ -319,6 +324,20 @@ function doPost(e) {
           if (!cm.proposal_sent_at) setCell_('CLIENTS', cm._row, 'proposal_sent_at', new Date());
           advanceStage_(b.client_id, 'Proposal Sent');
           append_('EVENTS', { ts: new Date(), client_id: b.client_id, tpl: 'm2a', type: 'proposal', ua: '' });
+          // Auto-build the M6A invoice from the proposal (keep number stable on re-save).
+          var prevInv = rows_('INVOICE').filter(function (r) { return String(r.client_id) === String(b.client_id); });
+          var invNo = prevInv.length ? prevInv[0].number : nextInvoiceNo_();
+          var ish = sheet_('INVOICE'), idata = ish.getDataRange().getValues();
+          for (var ij = idata.length - 1; ij >= 1; ij--) {
+            if (String(idata[ij][0]) === String(b.client_id)) ish.deleteRow(ij + 1);
+          }
+          append_('INVOICE', {
+            client_id: b.client_id, number: invNo,
+            date: Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Africa/Lagos', 'MMM d, yyyy'),
+            items: (b.items || []).map(function (x) { return x.item; }).join(', '),
+            total: ngn_(Number(b.amount) || 0),
+            bank: INVOICE_BANK, account_name: INVOICE_ACCOUNT_NAME, account_number: INVOICE_ACCOUNT_NUMBER
+          });
         }
       }
       return out_({ ok: true });
@@ -373,6 +392,12 @@ function doPost(e) {
 function slug_(s) {
   return String(s || 'client').toLowerCase().replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '').slice(0, 20) || 'client';
+}
+function ngn_(n) { return '₦' + (Number(n) || 0).toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function nextInvoiceNo_() {
+  var yr = new Date().getFullYear();
+  var n = rows_('INVOICE').filter(function (r) { return String(r.number || '').indexOf('HMZ-' + yr + '-') === 0; }).length + 1;
+  return 'HMZ-' + yr + '-' + ('0000' + n).slice(-4);
 }
 function rand_(n) {
   var a = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789', s = '';
